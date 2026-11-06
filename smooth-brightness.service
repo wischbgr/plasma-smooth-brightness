@@ -1,0 +1,26 @@
+[Unit]
+Description=Smooth screen brightness for KDE Plasma (smooth-brightnessd)
+PartOf=graphical-session.target
+After=graphical-session.target plasma-powerdevil.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/smooth-brightnessd
+# When the service stops or crashes, PowerDevil gets the brightness keys back
+ExecStopPost=%h/.local/bin/smooth-brightnessd --restore
+Restart=on-failure
+RestartSec=2
+
+# Override with:  systemctl --user edit smooth-brightness
+Environment=SB_STEP=5
+Environment=SB_LOW_STEPS=2
+Environment=SB_MIN_PERCENT=0
+Environment=SB_OFF_STEP=1
+# Empty = detect the sysfs backlight automatically
+Environment=SB_BACKLIGHT=
+Environment=SB_DURATION_MS=350
+Environment=SB_FPS=120
+Environment=SB_GAMMA=2.2
+
+[Install]
+WantedBy=graphical-session.target

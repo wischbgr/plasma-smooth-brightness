@@ -1,0 +1,727 @@
+#!/usr/bin/python3
+"""
+smooth-brightnessd - smooth, macOS-like screen brightness for KDE Plasma 6
+
+The daemon takes over the "Monitor Brightness Up/Down" keys in kglobalaccel,
+snaps the brightness to fixed levels (default: 0, 2, 5, 10 ... 100 %) and fades
+to the new value through the PowerDevil API (org.kde.ScreenBrightness), so the
+tray slider, power management and idle dimming stay in sync. The Plasma OSD
+shows the target value immediately.
+
+The lowest level (SB_MIN_PERCENT, default 0 % = PowerDevil's minimum) keeps the
+display on. With SB_OFF_STEP=1, a new press of "down" there writes raw value 0
+to the sysfs backlight via logind (backlight off); holding the key stops at the
+lowest level. "Up" restores the raw value from before switching off.
+
+Usage:
+  smooth-brightnessd            run the daemon (normally via systemd --user)
+  smooth-brightnessd --restore  hand the brightness keys back to PowerDevil
+  smooth-brightnessd up|down    trigger one step (for testing; daemon must run)
+
+Settings via environment variables (systemctl --user edit smooth-brightness):
+  SB_STEP=5            step size in percent
+  SB_LOW_STEPS=2       extra levels in percent, comma-separated (e.g. "1,2.5");
+                       empty = none
+  SB_MIN_PERCENT=0     lowest level, display still on (0 = PowerDevil's minimum)
+  SB_OFF_STEP=1        1 = one more press at the lowest level switches the
+                       backlight off (raw 0); 0 = no off step
+  SB_BACKLIGHT=        sysfs backlight device for the off step (e.g.
+                       intel_backlight); empty = detect automatically
+  SB_DURATION_MS=350   fade duration
+  SB_FPS=120           animation frame rate
+  SB_GAMMA=2.2         perceptual curve used for the fade (1 = linear)
+  SB_DEBUG=0           1 = verbose log (journalctl --user -u smooth-brightness)
+"""
+
+import math
+import os
+import signal
+import sys
+import time
+
+import dbus
+import dbus.mainloop.glib
+from gi.repository import GLib
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
+def env_bool(name, default):
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value not in ("0", "false", "no", "off")
+
+
+def parse_levels(text):
+    out = []
+    for part in text.replace(";", ",").split(","):
+        try:
+            v = float(part)
+        except ValueError:
+            continue
+        if 0 < v < 100:
+            out.append(v)
+    return out
+
+
+STEP = max(0.5, env_float("SB_STEP", 5))
+MIN_PERCENT = min(99.0, max(0.0, env_float("SB_MIN_PERCENT", 0)))
+OFF_STEP = env_bool("SB_OFF_STEP", True)
+BACKLIGHT = os.environ.get("SB_BACKLIGHT", "").strip()
+DURATION = max(0.0, env_float("SB_DURATION_MS", 350)) / 1000.0
+FPS = min(240.0, max(10.0, env_float("SB_FPS", 120)))
+GAMMA = max(0.1, env_float("SB_GAMMA", 2.2))
+DEBUG = env_bool("SB_DEBUG", False)
+
+# Levels in percent: MIN_PERCENT, extra levels (default 2), STEP, 2*STEP ... 100
+LEVELS = sorted(
+    {MIN_PERCENT, 100.0}
+    | {
+        l
+        for l in set(parse_levels(os.environ.get("SB_LOW_STEPS", "2")))
+        | {min(100.0, STEP * i) for i in range(1, math.ceil(100 / STEP) + 1)}
+        if l > MIN_PERCENT
+    }
+)
+
+# Fewer hardware/PowerDevil levels than this -> warn that fades will visibly step
+COARSE_LEVELS = 100
+# Steps without any sysfs change before concluding the display isn't a sysfs backlight
+LEARN_ATTEMPTS = 3
+
+SYSFS_BACKLIGHT = "/sys/class/backlight"
+
+# --- DBus names --------------------------------------------------------------
+SB_SERVICE = "org.kde.ScreenBrightness"
+SB_PATH = "/org/kde/ScreenBrightness"
+SB_IFACE = "org.kde.ScreenBrightness"
+SB_DISPLAY_IFACE = "org.kde.ScreenBrightness.Display"
+SUPPRESS_INDICATOR = 0x1  # PowerDevil: don't show its own OSD
+
+KGA_SERVICE = "org.kde.kglobalaccel"
+KGA_PATH = "/kglobalaccel"
+KGA_IFACE = "org.kde.KGlobalAccel"
+KGA_COMPONENT_IFACE = "org.kde.kglobalaccel.Component"
+# KGlobalAccel::SetShortcutFlag
+IS_DEFAULT = 1
+SET_PRESENT = 2
+NO_AUTOLOADING = 4
+
+OSD_SERVICE = "org.kde.plasmashell"
+OSD_PATH = "/org/kde/osdService"
+OSD_IFACE = "org.kde.osdService"
+
+LOGIN1_SERVICE = "org.freedesktop.login1"
+LOGIN1_SESSION = "/org/freedesktop/login1/session/auto"
+LOGIN1_SESSION_IFACE = "org.freedesktop.login1.Session"
+
+# Qt::Key_MonBrightnessUp / Qt::Key_MonBrightnessDown
+KEY_UP = 0x010000B2
+KEY_DOWN = 0x010000B3
+
+COMPONENT = "smooth-brightness"
+COMPONENT_FRIENDLY = "Smooth Screen Brightness"
+ACTIONS = {
+    "increase": ("Increase Screen Brightness (smooth)", KEY_UP, +1),
+    "decrease": ("Decrease Screen Brightness (smooth)", KEY_DOWN, -1),
+}
+# Action IDs are [component, action, friendly component, friendly action];
+# kglobalaccel looks up foreign actions by the first two fields only.
+POWERDEVIL_COMPONENT = "org_kde_powerdevil"
+POWERDEVIL_ACTIONS = {
+    "increase": "Increase Screen Brightness",
+    "decrease": "Decrease Screen Brightness",
+}
+
+
+def log(*args):
+    print(*args, flush=True)
+
+
+def debug(*args):
+    if DEBUG:
+        print(*args, flush=True)
+
+
+# --- sysfs backlight ----------------------------------------------------------
+def read_int(path):
+    with open(path) as f:
+        return int(f.read().strip())
+
+
+def backlight_devices():
+    """All usable sysfs backlights as {name: max_brightness}, ordered like the
+    kernel prefers them: firmware > platform > raw."""
+    order = {"firmware": 0, "platform": 1, "raw": 2}
+    found = []
+    try:
+        names = os.listdir(SYSFS_BACKLIGHT)
+    except OSError:
+        return {}
+    for name in names:
+        try:
+            with open(f"{SYSFS_BACKLIGHT}/{name}/type") as f:
+                kind = f.read().strip()
+            maximum = read_int(f"{SYSFS_BACKLIGHT}/{name}/max_brightness")
+        except (OSError, ValueError):
+            continue
+        if maximum > 0:
+            found.append((order.get(kind, 3), name, maximum))
+    return {name: maximum for _, name, maximum in sorted(found)}
+
+
+def read_raw_of(name):
+    return read_int(f"{SYSFS_BACKLIGHT}/{name}/brightness")
+
+
+def colliding_levels(levels, maximum):
+    """Pairs of neighbouring levels (percent) that map to the same hardware value."""
+    raws = [int(round(l * maximum / 100.0)) for l in levels]
+    return [(levels[i], levels[i + 1]) for i in range(len(levels) - 1) if raws[i] == raws[i + 1]]
+
+
+# --- Shortcut handling --------------------------------------------------------
+def action_id(name):
+    return dbus.Array(
+        [COMPONENT, name, COMPONENT_FRIENDLY, ACTIONS[name][0]], signature="s"
+    )
+
+
+def powerdevil_id(name):
+    return dbus.Array([POWERDEVIL_COMPONENT, POWERDEVIL_ACTIONS[name], "", ""], signature="s")
+
+
+def keys_arg(keys):
+    """List of Qt key codes -> DBus a(ai) (one QKeySequence per entry)."""
+    return dbus.Array(
+        [dbus.Struct((dbus.Array([k, 0, 0, 0], signature="i"),)) for k in keys],
+        signature="(ai)",
+    )
+
+
+def keys_from_reply(reply):
+    return [int(seq[0][0]) for seq in reply if len(seq[0]) and int(seq[0][0])]
+
+
+def kglobalaccel(bus):
+    return dbus.Interface(bus.get_object(KGA_SERVICE, KGA_PATH), KGA_IFACE)
+
+
+def restore_powerdevil(bus):
+    """Release our shortcuts and give PowerDevil its default keys back."""
+    kga = kglobalaccel(bus)
+    for name, (_, key, _) in ACTIONS.items():
+        try:
+            aid = action_id(name)
+            kga.doRegister(aid)
+            kga.setShortcutKeys(aid, keys_arg([]), SET_PRESENT | NO_AUTOLOADING)
+            kga.setInactive(aid)
+        except dbus.DBusException as e:
+            log(f"Could not release shortcut '{name}': {e.get_dbus_message()}")
+        try:
+            kga.setForeignShortcutKeys(powerdevil_id(name), keys_arg([key]))
+        except dbus.DBusException as e:
+            log(f"Could not set PowerDevil shortcut: {e.get_dbus_message()}")
+    log("Brightness keys handed back to PowerDevil.")
+
+
+class SmoothBrightness:
+    """All regular brightness changes are animated through PowerDevil. Only the
+    optional off step writes the sysfs backlight directly (raw 0 via logind, and
+    the previous raw value when switching back on) - PowerDevil is at its lowest
+    level in both cases anyway."""
+
+    def __init__(self, bus):
+        self.bus = bus
+        self.me = bus.get_unique_name()
+        # PowerDevil display (all regular brightness changes go through it)
+        self.display = None
+        self.pd_max = None
+        self.pd_coarse_warned = False
+        # sysfs backlight, only needed for the off step
+        self.dev = None  # e.g. intel_backlight
+        self.dev_confirmed = False  # verified to be the device PowerDevil drives
+        self.no_sysfs = False  # PowerDevil drives the display some other way
+        self.no_sysfs_logged = False
+        self.learn_before = None  # raw values of all devices before a step
+        self.learn_misses = 0
+        self.login1 = None
+        # Animation state, in PowerDevil units (0 .. pd_max)
+        self.current = None  # last value sent to PowerDevil
+        self.target = None
+        self.anim = None  # (start_p, end_p, t0)
+        self.timer = None
+        # Off step
+        self.off = False  # backlight switched off by us (raw 0)
+        self.pending_off = False  # "off" requested while a fade to the bottom runs
+        self.raw_before_off = None  # restored when switching back on
+        self.off_timer = None
+        self.off_deadline = 0.0
+        self.off_warned = False
+        self.last_event = {}
+
+        bus.add_signal_receiver(
+            self.on_brightness_changed, "BrightnessChanged", SB_IFACE, SB_SERVICE, SB_PATH
+        )
+        for sig in ("DisplayAdded", "DisplayRemoved", "BrightnessRangeChanged"):
+            bus.add_signal_receiver(self.reset_display, sig, SB_IFACE, SB_SERVICE, SB_PATH)
+        bus.watch_name_owner(SB_SERVICE, self.reset_display)
+        bus.watch_name_owner(KGA_SERVICE, self.on_kglobalaccel_owner)
+        for sig in ("globalShortcutPressed", "globalShortcutRepeated"):
+            bus.add_signal_receiver(
+                self.on_shortcut, sig, KGA_COMPONENT_IFACE, KGA_SERVICE, None,
+                member_keyword="member",
+            )
+
+    # -- Shortcuts --------------------------------------------------------
+    def on_kglobalaccel_owner(self, owner):
+        if owner:
+            # kglobalaccel (re)started: register our shortcuts
+            GLib.idle_add(self.register_shortcuts)
+
+    def register_shortcuts(self):
+        try:
+            kga = kglobalaccel(self.bus)
+            for name, (_, key, _) in ACTIONS.items():
+                # Take the key away from PowerDevil if it still holds it
+                try:
+                    pd_keys = keys_from_reply(kga.shortcutKeys(powerdevil_id(name)))
+                    if key in pd_keys:
+                        kga.setForeignShortcutKeys(powerdevil_id(name), keys_arg([]))
+                        log(f"Disabled PowerDevil shortcut '{POWERDEVIL_ACTIONS[name]}'.")
+                except dbus.DBusException:
+                    pass
+
+                aid = action_id(name)
+                kga.doRegister(aid)
+                kga.setShortcutKeys(aid, keys_arg([key]), IS_DEFAULT)
+                got = keys_from_reply(
+                    kga.setShortcutKeys(aid, keys_arg([key]), SET_PRESENT | NO_AUTOLOADING)
+                )
+                if key in got:
+                    debug(f"Registered shortcut '{name}'.")
+                else:
+                    owners = [
+                        f"{info[0]}/{info[1]}" for info in kga.getGlobalShortcutsByKey(key)
+                    ]
+                    log(
+                        f"WARNING: key for '{name}' is taken by {owners or '?'} - "
+                        "remove it there in System Settings -> Shortcuts."
+                    )
+            log(f"Ready (levels {', '.join(f'{l:g}' for l in LEVELS[:4])} ... 100 %, "
+                f"off step {'on' if OFF_STEP else 'off'}, {DURATION * 1000:.0f} ms, "
+                f"{FPS:g} FPS, gamma {GAMMA:g}).")
+        except dbus.DBusException as e:
+            log(f"Registering with kglobalaccel failed: {e.get_dbus_message()}")
+        return False
+
+    def on_shortcut(self, component, action, timestamp, member=None):
+        if component != COMPONENT or action not in ACTIONS:
+            return
+        # Debounce duplicate events (pressed + repeated for the same key)
+        now = time.monotonic()
+        if now - self.last_event.get(action, 0) < 0.008:
+            return
+        self.last_event[action] = now
+        debug(f"{member} {action}")
+        self.step(ACTIONS[action][2], repeat=(member == "globalShortcutRepeated"))
+
+    # -- PowerDevil --------------------------------------------------------
+    def reset_display(self, *args):
+        self.display = None
+        self.pd_max = None
+
+    def ensure_display(self):
+        if self.display is not None:
+            return True
+        try:
+            root = self.bus.get_object(SB_SERVICE, SB_PATH)
+            names = root.Get(SB_IFACE, "DisplaysDBusNames", dbus_interface=dbus.PROPERTIES_IFACE)
+            chosen = None
+            for n in names:
+                obj = self.bus.get_object(SB_SERVICE, f"{SB_PATH}/{n}")
+                if obj.Get(SB_DISPLAY_IFACE, "IsInternal", dbus_interface=dbus.PROPERTIES_IFACE):
+                    chosen = obj
+                    break
+                chosen = chosen or obj
+            if chosen is None:
+                log("PowerDevil reports no display.")
+                return False
+            self.pd_max = int(chosen.Get(SB_DISPLAY_IFACE, "MaxBrightness",
+                                         dbus_interface=dbus.PROPERTIES_IFACE))
+            self.display = dbus.Interface(chosen, SB_DISPLAY_IFACE)
+            if 0 < self.pd_max < COARSE_LEVELS and not self.pd_coarse_warned:
+                self.pd_coarse_warned = True
+                log(f"WARNING: PowerDevil offers only {self.pd_max + 1} brightness levels "
+                    "for this display - fades will visibly step.")
+            return self.pd_max > 0
+        except dbus.DBusException as e:
+            log(f"PowerDevil not reachable: {e.get_dbus_message()}")
+            self.reset_display()
+            return False
+
+    def read_pd(self):
+        return int(self.display.Get(SB_DISPLAY_IFACE, "Brightness",
+                                    dbus_interface=dbus.PROPERTIES_IFACE))
+
+    def set_pd(self, value, final=False):
+        self.current = value
+        try:
+            if final:
+                self.display.SetBrightnessWithContext(
+                    value, SUPPRESS_INDICATOR, COMPONENT,
+                    reply_handler=lambda: None,
+                    error_handler=lambda e: (log(f"SetBrightness: {e}"), self.reset_display()),
+                )
+            else:
+                self.display.SetBrightnessWithContext(
+                    value, SUPPRESS_INDICATOR, COMPONENT, ignore_reply=True
+                )
+        except dbus.DBusException as e:
+            log(f"SetBrightness failed: {e.get_dbus_message()}")
+            self.reset_display()
+            self.stop_anim()
+
+    def min_pd(self):
+        return int(round(MIN_PERCENT * self.pd_max / 100.0))
+
+    def on_brightness_changed(self, display, value, source, context):
+        if str(source) == self.me:
+            return
+        # Change by someone else (slider, idle dimming, ...)
+        if self.anim is not None:
+            debug(f"external change to {int(value)} by {source} - animation cancelled")
+            self.stop_anim()
+            self.pending_off = False
+        if self.off:
+            if self.pd_max and int(value) <= self.min_pd():
+                self.enforce_off()  # PowerDevil re-wrote its minimum -> switch off again
+            else:
+                self.off = False
+
+    # -- sysfs backlight (off step) ------------------------------------------
+    def ensure_backlight(self):
+        """Pick the sysfs backlight that PowerDevil drives. Returns False if the
+        off step can't be used."""
+        if self.no_sysfs:
+            return False
+        if self.dev is not None:
+            return True
+        devices = backlight_devices()
+        if BACKLIGHT:
+            if BACKLIGHT in devices:
+                self.choose_backlight(BACKLIGHT, devices[BACKLIGHT], confirmed=True,
+                                      why="set by SB_BACKLIGHT")
+                return True
+            log(f"WARNING: SB_BACKLIGHT={BACKLIGHT} not found in {SYSFS_BACKLIGHT} "
+                f"(available: {', '.join(devices) or 'none'}) - detecting automatically.")
+        if not devices:
+            self.mark_no_sysfs("no device in " + SYSFS_BACKLIGHT)
+            return False
+        if len(devices) == 1:
+            name = next(iter(devices))
+            self.choose_backlight(name, devices[name], confirmed=True, why="only device")
+            return True
+        # Several devices: the one whose brightness ratio matches PowerDevil's.
+        # Confirmed after the next step by checking which one actually changed.
+        name = self.best_ratio_match(list(devices))
+        self.choose_backlight(name, devices[name], confirmed=False,
+                              why=f"brightness matches PowerDevil best among {', '.join(devices)}; "
+                                  "will confirm on the next step")
+        return True
+
+    def best_ratio_match(self, names):
+        devices = backlight_devices()
+        try:
+            ratio = self.read_pd() / self.pd_max
+        except (dbus.DBusException, TypeError, ZeroDivisionError):
+            return names[0]
+
+        def distance(name):
+            try:
+                return abs(read_raw_of(name) / devices[name] - ratio)
+            except (OSError, ValueError, KeyError):
+                return float("inf")
+        # min() keeps the kernel's preference order on ties
+        return min(names, key=distance)
+
+    def choose_backlight(self, name, maximum, confirmed, why):
+        changed = name != self.dev
+        self.dev = name
+        self.dev_confirmed = confirmed
+        if not changed:
+            return
+        log(f"Backlight device for the off step: {name} ({why}).")
+        if maximum < COARSE_LEVELS:
+            log(f"WARNING: {name} has only {maximum + 1} hardware levels - "
+                "fades will visibly step.")
+        clashes = colliding_levels(LEVELS, maximum)
+        if clashes:
+            pairs = ", ".join(f"{a:g}/{b:g} %" for a, b in clashes)
+            log(f"WARNING: on {name} these levels map to the same hardware value: {pairs}. "
+                "Adjust SB_LOW_STEPS / SB_MIN_PERCENT.")
+
+    def mark_no_sysfs(self, reason):
+        self.no_sysfs = True
+        self.dev = None
+        if OFF_STEP and not self.no_sysfs_logged:
+            self.no_sysfs_logged = True
+            log(f"Off step unavailable ({reason}); fades work as usual.")
+
+    def snapshot_backlights(self):
+        values = {}
+        for name in backlight_devices():
+            try:
+                values[name] = read_raw_of(name)
+            except (OSError, ValueError):
+                pass
+        return values
+
+    def start_learning(self):
+        """Before a step: remember all raw values if the device isn't confirmed yet."""
+        if OFF_STEP and not self.dev_confirmed and not self.no_sysfs and self.learn_before is None:
+            self.learn_before = self.snapshot_backlights()
+
+    def finish_learning(self):
+        """Shortly after a step: the device that changed is the one PowerDevil drives."""
+        before, self.learn_before = self.learn_before, None
+        if before is None or self.dev_confirmed:
+            return False
+        after = self.snapshot_backlights()
+        changed = [n for n in after if n in before and after[n] != before[n]]
+        devices = backlight_devices()
+        if changed:
+            name = changed[0] if len(changed) == 1 else self.best_ratio_match(changed)
+            self.choose_backlight(name, devices[name], confirmed=True,
+                                  why="changed together with PowerDevil")
+        else:
+            self.learn_misses += 1
+            debug(f"no sysfs backlight changed ({self.learn_misses}/{LEARN_ATTEMPTS})")
+            if self.learn_misses >= LEARN_ATTEMPTS:
+                self.mark_no_sysfs("no sysfs backlight follows PowerDevil")
+        return False
+
+    def read_raw(self):
+        return read_raw_of(self.dev)
+
+    def write_raw(self, value):
+        try:
+            if self.login1 is None:
+                self.login1 = dbus.Interface(
+                    dbus.SystemBus().get_object(LOGIN1_SERVICE, LOGIN1_SESSION),
+                    LOGIN1_SESSION_IFACE,
+                )
+            self.login1.SetBrightness(
+                "backlight", self.dev, dbus.UInt32(value),
+                reply_handler=lambda: None,
+                error_handler=lambda e: (log(f"logind SetBrightness: {e}"),
+                                         setattr(self, "login1", None)),
+            )
+        except dbus.DBusException as e:
+            log(f"logind SetBrightness failed: {e.get_dbus_message()}")
+            self.login1 = None
+
+    def switch_off(self):
+        try:
+            raw = self.read_raw()
+            if raw > 0:
+                self.raw_before_off = raw
+        except (OSError, ValueError):
+            pass
+        self.off = True
+        self.enforce_off()
+
+    def switch_on(self, base):
+        self.off = False
+        self.pending_off = False
+        self.write_raw(self.raw_before_off or 1)  # back to the lowest level
+        self.show_osd(int(round(MIN_PERCENT)))
+        if base != self.min_pd():
+            self.set_pd(self.min_pd(), final=True)
+
+    def enforce_off(self):
+        """Write raw value 0 and hold it for ~1 s: PowerDevil's helper may
+        asynchronously write its minimum again afterwards."""
+        self.off_deadline = time.monotonic() + 1.0
+        if self.off_timer is None:
+            self.off_timer = GLib.timeout_add(10, self.off_tick)
+            self.off_tick()
+
+    def off_tick(self):
+        if not self.off:
+            self.off_timer = None
+            return False
+        try:
+            raw = self.read_raw()
+        except (OSError, ValueError, TypeError):
+            raw = None
+        if time.monotonic() > self.off_deadline:
+            self.off_timer = None
+            if raw and not self.off_warned:
+                self.off_warned = True
+                log(f"WARNING: {self.dev} does not stay at raw value 0 (now {raw}) - "
+                    "the driver may not allow switching the backlight off. "
+                    "Set SB_OFF_STEP=0 to disable the off step.")
+            return False
+        if raw:
+            self.write_raw(0)
+        return True
+
+    # -- Logic ------------------------------------------------------------
+    def step(self, direction, repeat=False):
+        if not self.ensure_display():
+            return
+        has_backlight = OFF_STEP and self.ensure_backlight()
+        try:
+            base = self.target if self.anim is not None else self.read_pd()
+            raw = self.read_raw() if has_backlight else None
+        except (OSError, ValueError, dbus.DBusException) as e:
+            log(f"Could not read brightness: {e}")
+            self.reset_display()
+            return
+
+        if raw == 0 and self.anim is None:
+            # Backlight is off
+            if direction > 0:
+                self.switch_on(base)
+            return
+
+        cur = base * 100.0 / self.pd_max
+        tol = STEP * 0.01  # values just next to a level count as on that level
+        if direction > 0:
+            pct = next((l for l in LEVELS if l > cur + tol), 100.0)
+        else:
+            if cur <= MIN_PERCENT + tol:
+                # Lowest level: a new press switches off, holding stays here
+                if has_backlight and not repeat:
+                    if self.anim is not None:
+                        # Let the fade finish in small steps first: a big jump makes
+                        # PowerDevil's helper start its own slow animation, which
+                        # would end above 0 after we switched off.
+                        self.pending_off = True
+                    else:
+                        self.switch_off()
+                else:
+                    self.show_osd(int(round(MIN_PERCENT)))
+                return
+            pct = next((l for l in reversed(LEVELS) if l < cur - tol), MIN_PERCENT)
+        target = int(round(pct * self.pd_max / 100.0))
+
+        self.off = False
+        self.pending_off = False
+        self.show_osd(int(round(pct)))
+        if target == base and self.anim is None:
+            return
+        if self.anim is None:
+            self.start_learning()
+        self.animate_to(target, start=base if self.anim is None else self.current)
+
+    def to_p(self, v):
+        return (max(0, v) / self.pd_max) ** (1.0 / GAMMA)
+
+    def from_p(self, p):
+        return self.pd_max * (max(0.0, p) ** GAMMA)
+
+    def animate_to(self, target, start):
+        self.target = target
+        self.current = start
+        if DURATION <= 0:
+            self.stop_anim()
+            self.set_pd(target, final=True)
+            self.after_fade()
+            return
+        self.anim = (self.to_p(start), self.to_p(target), time.monotonic())
+        if self.timer is None:
+            self.timer = GLib.timeout_add(max(1, int(1000 / FPS)), self.frame)
+
+    def frame(self):
+        if self.anim is None:
+            self.timer = None
+            return False
+        p0, p1, t0 = self.anim
+        t = (time.monotonic() - t0) / DURATION
+        if t >= 1.0:
+            self.anim = None
+            self.timer = None
+            self.set_pd(self.target, final=True)
+            self.after_fade()
+            return False
+        e = 1.0 - (1.0 - t) ** 3  # ease-out cubic
+        value = int(round(self.from_p(p0 + (p1 - p0) * e)))
+        if value != self.current:
+            self.set_pd(value)
+        return True
+
+    def after_fade(self):
+        if self.pending_off and self.target <= self.min_pd():
+            self.switch_off()
+        self.pending_off = False
+        if self.learn_before is not None:
+            # give PowerDevil's helper time to write the final value
+            GLib.timeout_add(400, self.finish_learning)
+
+    def stop_anim(self):
+        self.anim = None
+        if self.timer is not None:
+            GLib.source_remove(self.timer)
+            self.timer = None
+
+    def show_osd(self, percent):
+        try:
+            self.bus.call_async(
+                OSD_SERVICE, OSD_PATH, OSD_IFACE, "brightnessChanged", "i", (percent,),
+                None, lambda e: debug(f"OSD: {e}"),
+            )
+        except dbus.DBusException as e:
+            debug(f"OSD: {e}")
+
+
+def main():
+    args = sys.argv[1:]
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+
+    if args and args[0] == "--restore":
+        restore_powerdevil(bus)
+        return 0
+    if args and args[0] in ("up", "down"):
+        name = "increase" if args[0] == "up" else "decrease"
+        try:
+            kga = kglobalaccel(bus)
+            # The daemon clears its keys on stop (--restore), so no keys = not running
+            if not keys_from_reply(kga.shortcutKeys(action_id(name))):
+                print("The daemon is not running "
+                      "(systemctl --user start smooth-brightness).", file=sys.stderr)
+                return 1
+            path = kga.getComponent(COMPONENT)
+            comp = dbus.Interface(bus.get_object(KGA_SERVICE, path), KGA_COMPONENT_IFACE)
+            comp.invokeShortcut(name)
+        except dbus.DBusException as e:
+            print(f"Failed (is the daemon running?): {e.get_dbus_message()}", file=sys.stderr)
+            return 1
+        return 0
+    if args:
+        print(__doc__.strip())
+        return 0 if args[0] in ("-h", "--help") else 2
+
+    loop = GLib.MainLoop()
+    SmoothBrightness(bus)  # registers the shortcuts once kglobalaccel is available
+    try:
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except ImportError:
+        signal_add = GLib.unix_signal_add
+    for s in (signal.SIGTERM, signal.SIGINT):
+        signal_add(GLib.PRIORITY_DEFAULT, s, lambda *a: (loop.quit(), False)[1])
+    loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
